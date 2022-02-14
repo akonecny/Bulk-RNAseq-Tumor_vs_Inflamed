@@ -82,6 +82,9 @@ input_data_dir <- file.path(base_dir, "input_data")
 output_data_dir <- file.path(base_dir, "output_data")
 plots_dir <- file.path(base_dir, "plots")
 
+dir.create(output_data_dir)
+dir.create(plots_dir)
+
 ```
 
 ```{r get_data}
