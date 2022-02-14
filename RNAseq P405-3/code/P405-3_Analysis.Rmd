@@ -1,0 +1,1306 @@
+---
+title: 'P405-3: Effect of IL1R1 Signalling in Tumor Tregs'
+author: 'Analyst: Andrew Konecny, Experimenters: Andrew Konecny/Florian Mair'
+output:
+    html_document:
+    number_sections: yes
+    toc: yes
+    toc_depth: '2'
+    toc_float: yes
+editor_options:
+  chunk_output_type: console
+---
+
+# Hypotheses 
+
+Tregs up-regulate the IL1R1 receptor upon TCR activation. Head and neck squamous cell carcinoma (HNSCC) is enriched in IL1R1+ Tregs which co-express ICOS as compared to non malignant inflamed oral mucosa. IL1R1+ Tumor Tregs respond to TCR activation with and without IL1 differently than IL1R1- Tumor Tregs and PBMC Tregs.
+       
+# Experimental design 
+
+6 HNSCCs and matched PBMCs, if available, were stained and sorted by FACS. HNSCC tissues were sorted for IL1R1+ and IL1R1- Tregs (singlets, cells, live, CD19-, CD3+, CD4+, CD25high, CD127low) and PBMCs were sorted for total Tregs, as there is no expression of IL1R1 on Tregs in the blood. Cells were cultured at 10-50K cells per well for 1, 2, and 3 days with no stimulation (only on day 1), Miltiny Treg Suppressor Inspector beads [aCD2/CD3/CD28] at (1:1 bead:cell), and Miltiny Treg Suppressor Inspector beads [aCD2/CD3/CD28] at (1:1 bead:cell) + rIL-1b (50 ng/mL). Cultured cells were again stained and resorted for SMARTseq with a target cell number of 250 cells.
+
+Experiment took place: 2021-10-11 - 2021-10-15
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+library(knitr)
+library(plyr)
+library(dplyr)
+library(ggplot2); theme_set(
+  theme_bw(20) +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_rect(colour="black", fill=NA, size=1),
+          axis.text=element_text(colour="black"),
+          axis.ticks=element_line(colour="black"),
+          legend.key = element_blank(),
+          text = element_text(size=12),
+          strip.text.x = element_text(size = 10,margin = margin( b = 2, t = 2) ),
+            strip.background = element_rect(fill="white", colour="black")))
+
+library(ggthemes)
+library(ggbeeswarm)
+library(viridis)
+library(stringr)
+library(readxl)
+library(kableExtra)
+library(RColorBrewer)
+library(plotly)
+library(tidyr)
+library(gtools)
+library(devtools)  #if needed to obtain github packages
+# devtools::install_github('mjdufort/TCRtools') #if needed to get Matt Dufort's package
+library(TCRtools) 
+# devtools::install_github("stephenturner/annotables")
+library(annotables)
+# devtools::install_github('mjdufort/countSubsetNorm')
+library(countSubsetNorm)
+# devtools::install_github('benaroyaresearch/RNAseQC')
+library(RNAseQC) 
+library(data.table)
+library(edgeR)
+library(ggrepel)
+library(ComplexHeatmap)
+# devtools::install_github("mjdufort/geneSetTools")
+library(geneSetTools) # For barcode plots
+library(egg) #For ggarrange
+library(ggpubr) #Also for ggarrange
+# devtools::install_github('benaroyaresearch/DGETools')
+library(DGETools)
+library(circlize)
+library(pheatmap)
+
+opts_chunk$set(fig.width=6, fig.height=4.0, cache = TRUE, echo=FALSE, warning=FALSE, message=FALSE)
+opts_knit$set(root.dir = getwd())
+
+options(stringsAsFactors = FALSE)
+```
+
+```{r set_up_directories, cache = TRUE}
+
+base_dir <- dirname(getwd())
+input_data_dir <- file.path(base_dir, "input_data")
+output_data_dir <- file.path(base_dir, "output_data")
+plots_dir <- file.path(base_dir, "plots")
+
+```
+
+```{r get_data}
+# Load data
+anno <- read.csv(file.path(input_data_dir,"2021-10-20 Sample_Annotation_P405-3.csv"), header = TRUE)
+metrics <- read.csv(file.path(input_data_dir,"P405-3_AAAM5GYM5_211103_combined_metrics.csv"), header = TRUE)
+counts <- read.csv(file.path(input_data_dir,"211109-P405-3_RawGeneCounts.csv"), header = TRUE)
+
+# Clean up annotation
+as.matrix(names(counts))
+
+temp <- data.frame(Sample.Name=str_extract(names(counts), "(?<=_)(.*)(?=(\\.\\.\\.))")[5:92], libid=str_extract(names(counts), "lib.*")[5:92])
+
+anno <- anno %>%
+  right_join(temp, by = "Sample.Name")
+
+remove(temp)
+
+names(counts)[5:92] <- str_extract(names(counts), "lib.*")[5:92]
+as.matrix(names(counts))
+
+# Clean up metrics P405-3
+metrics$flowcell <- str_extract(metrics$libId, "(?<=_).*")
+metrics$libid <- str_extract(metrics$libId, ".*(?=_)")
+
+# Save for offline analysis
+save(anno,
+     metrics,
+     counts,
+     file = file.path(input_data_dir,"P405-3_Data.Rdata"))
+
+# Load data from organized rdata
+load(file.path(input_data_dir,"P405-3_Data.Rdata"))
+
+# Track flowcell info in case projects were spread across two flowcells
+anno$batch <- "Batch1"
+
+# Join anno and metrics into one design table
+
+design <- full_join(metrics, anno, by= c("libid" = "libid"))
+write.csv(design, file.path(input_data_dir, "P405-3_design.csv"))
+
+counts <- counts[,-c(2:4)]
+
+# Transform variables and create some new variables 
+# to make downstream analysis more convenient
+
+# Replace characters in Cell.Type to adhere to syntax
+table(design$Cell.Type)
+design$Cell.Type <- str_replace_all(design$Cell.Type, " ", "_")
+table(design$Cell.Type)
+
+# Treg_IL1R1_Neg Treg_IL1R1_Pos 
+#             56             32 
+
+# Replace Character in Stimulation to adhere to syntax
+table(design$Stimulation)
+design$Stimulation <- str_replace_all(design$Stimulation, " ", "_")
+table(design$Stimulation)
+
+# Miltenyi_Beads Miltenyi_Beads_and_IL1b                 No_Stim 
+#             36                      36                      16 
+
+# Make Stimulation a factor
+table(design$Stimulation)
+design$Stimulation <- factor(design$Stimulation, levels = c("No_Stim",
+                                                        "Miltenyi_Beads",
+                                                        "Miltenyi_Beads_and_IL1b"))
+
+# Make a column that reports both cell type and stimulation
+design$Cell.Type_Stimulation <- paste(design$Cell.Type, design$Stimulation, sep = "_")
+design$Cell.Type_Stimulation <- factor(design$Cell.Type_Stimulation, levels = c(
+                                                                  "Treg_IL1R1_Neg_No_Stim",
+                                                                  "Treg_IL1R1_Pos_No_Stim",
+                                                                  "Treg_IL1R1_Neg_Miltenyi_Beads",
+                                                                  "Treg_IL1R1_Pos_Miltenyi_Beads",
+                                                                  "Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b",
+                                                                  "Treg_IL1R1_Pos_Miltenyi_Beads_and_IL1b"))
+
+# Make a column that reports tissue, cell type, timepoint, and treatment
+design$sample_desc <- paste(design$Tissue, design$Cell.Type_Stimulation, design$Timepoint, sep = "_")
+design$sample_desc <- factor(design$sample_desc, levels = c("Blood_Treg_IL1R1_Neg_No_Stim_D1",
+                                                            "Tumor_Treg_IL1R1_Neg_No_Stim_D1",
+                                                            "Tumor_Treg_IL1R1_Pos_No_Stim_D1",
+                                                            "Blood_Treg_IL1R1_Neg_Miltenyi_Beads_D1",
+                                                            "Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_D1",
+                                                            "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_D1",
+                                                            "Blood_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b_D1",
+                                                            "Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b_D1",
+                                                            "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_and_IL1b_D1",
+                                                            "Blood_Treg_IL1R1_Neg_Miltenyi_Beads_D2",
+                                                            "Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_D2",
+                                                            "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_D2",
+                                                            "Blood_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b_D2",
+                                                            "Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b_D2",
+                                                            "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_and_IL1b_D2",
+                                                            "Blood_Treg_IL1R1_Neg_Miltenyi_Beads_D3",
+                                                            "Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_D3",
+                                                            "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_D3",
+                                                            "Blood_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b_D3",
+                                                            "Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b_D3",
+                                                            "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_and_IL1b_D3"
+                                                            ))
+
+# Make cell number a factor
+design$Cell.Number <- as.factor(design$Cell.Number)
+
+# Make sure the order of libs in counts and design match. 
+counts <- counts[,c("geneId",design$libid)]
+```
+
+```{r set_up_colors}
+set.seed(123)
+
+# Donor Colors
+n_patients <- length(unique(design$Donor.ID))
+patient_colors <- brewer.pal(n_patients, "Dark2")
+names(patient_colors)<- unique(design$Donor.ID)
+
+# Stimulation Colors
+stimulation_colors <- c("No_Stim" = "seagreen1",
+                      "Miltenyi_Beads" = "gold2",
+                      "Miltenyi_Beads_and_IL1b" = "plum4")
+
+# Cell Type Colors
+cell_type_colors <- c("Treg_IL1R1_Neg" = "#e07872",
+                      "Treg_IL1R1_Pos" = "#862020")
+
+# Timepoint Colors
+timepoint_colors <- c("D1" = "khaki1",
+                      "D2" = "chocolate1",
+                      "D3" = "firebrick1")
+
+# Tissue Colors
+tissue_colors <- c("Blood" = "red4",
+                   "Tumor" = "turquoise4")
+
+# Cell Type and Treatment Colors
+cell_type_stimulation_colors <- brewer.pal(6, "Set3")
+names(cell_type_stimulation_colors) <- levels(design$Cell.Type_Stimulation)
+
+# Cell Number Colors
+cell_number_colors <- brewer.pal(5, "Set2")
+names(cell_number_colors)<- levels(design$Cell.Number)
+```
+
+# RNAseq Quality Control
+
+```{r set_qc_cuts}
+
+#Set QC cuts
+align_cut = 70
+total_reads_cut = 1
+median_cv_cut = 0.85
+
+design$pct_aligned <- design$mapped_reads_w_dups*100
+
+design$qc_pass <- design$fastq_total_reads > total_reads_cut*10^6 &
+  design$pct_aligned > align_cut &
+  design$median_cv_coverage < median_cv_cut 
+```
+
+## Reads per library
+
+RNA-seq library quality is assessed and low-quality libraries are removed. The plot below displays the number of reads per library, with libraries ordered from least to most reads. The horizontal line indicates `r total_reads_cut` million reads for library. Libraries with fewer reads than this are removed from analysis. All libraries pass the quality threshold for number of reads. 
+
+```{r qcplots_total_reads, fig.width=7, fig.height=3.5}
+#Make a barplot of total reads. Arrange libraries from lowest number of reads to highest.
+plot_options <- list(geom_bar(aes(text = sample_desc),
+                              stat="identity"),
+                       scale_fill_manual(values = patient_colors),
+                       geom_hline(yintercept = total_reads_cut),
+                       labs(x="Library", y="Total reads in millions", fill = ""),
+                       theme(text = element_text(size=12)),
+                       theme(axis.text.x = element_blank(),
+                             axis.ticks.x = element_blank()),
+                       guides(fill=guide_legend(nrow=6))
+)
+
+g_reads_donor <- ggplot(data = design, 
+                     aes(x=reorder(libid, fastq_total_reads),
+                     y=fastq_total_reads/10^6,
+                     fill = as.factor(Donor.ID))) +
+                     plot_options +
+                     labs(title = "P405-3",
+                          fill = "Donor")
+
+print(g_reads_donor)
+```
+
+## Percent alignment and gene coverage
+
+The following plot shows percent alignment (higher is better) and the median CV of coverage (a measure of how evenly reads cover genes, lower is better) of samples that passed the cutoff for number of reads. Lines marking the position of quality control cuts are shown. Samples in the upper left box pass quality control. The cutoffs select libraries with alignment over `r align_cut`% and a median CV of coverage of less than `r median_cv_cut`. There are no libraries that show immediate concern. 
+
+**Interactive plot**
+
+Hover the mouse over a point in the plot to see sample details. 
+
+```{r qc_cut_plot, fig.width=6, fig.height=4}
+
+g_qc <- ggplot(data = design[design$fastq_total_reads > total_reads_cut*10^6, ]) +
+  geom_point(aes(x=median_cv_coverage, 
+                 y=pct_aligned,
+                 color=as.factor(Donor.ID), 
+                 # shape = batch,
+                 text=sample_desc),size=1.5, alpha =0.7) + 
+  scale_color_manual(values = patient_colors)+
+  labs(x="Median CV coverage", y = "Percent alignment", color="Donor")+
+  geom_hline(yintercept =  align_cut)+
+  geom_vline(xintercept =  median_cv_cut)+
+  ylim(c(0,100))+
+  xlim(c(0,1.1))+
+  theme(text = element_text(size=12))+
+  guides(colour=guide_legend(nrow=6))
+
+ggplotly(g_qc, tooltip = c("text"))%>%
+  layout(yaxis = list(autorange = TRUE),
+         legend = list(x = 1.0, y = 1, yanchor="top"),
+         margin = list(l = 50, r = 170, b = 50, t = 50))
+
+```
+
+```{r make_qc_cuts}
+design_qc <- design %>% dplyr::filter(qc_pass ==TRUE)
+
+libs_pass <- design_qc$libid
+counts_qc <- counts[,c("geneId",libs_pass)]
+
+#Make sure libraries in counts and metrics are in the same order
+lib_order <- match(libs_pass, design_qc$libid)
+design_qc <- design_qc[lib_order,]
+
+pct_pass_qc <- round(nrow(design_qc)/nrow(design) *100)
+```
+
+Overall, out of `r nrow(design)` libraries, `r nrow(design_qc)`, (`r pct_pass_qc`%) libraries passed quality control.
+
+```{r gene_filtering}
+## Keep protein coding genes with HGNC symbols, and drop non-protein-coding genes
+
+counts_tmp <-
+    counts_qc %>%
+    as.data.frame() %>%
+    mutate(gene = get_HGNC(geneId, type="protein_coding")) %>%
+    # mutate(gene = get_HGNC(geneId)) %>%
+    dplyr::select(!geneId) %>%
+    as.data.table()
+
+## use data.table to aggregate/sum counts for duplicated HGNC symbols (way faster than stats::aggregate)
+
+# this also drops rows with HGNC.symbols==NA, which should include any non-protein-coding genes
+
+counts_pc <-
+    counts_tmp[
+        , lapply(.SD, sum), by=gene, .SDcols=grep("^lib", colnames(counts_tmp), value=TRUE)] %>%
+    arrange(gene) %>%
+    dplyr::filter(gene != "MTRNR2L1") %>% # exclude MTRNR2L1
+    as.data.frame() %>%
+    magrittr::set_rownames(., value=.$gene)
+
+counts_pc <- counts_pc[, -which(colnames(counts_pc) == "gene")]
+
+dim(counts_pc)
+# 19830 genes, 88 libraries
+
+## filter lowly expressed genes
+
+#Define a function to filter out lowly expressed genes
+gene_filter <- function(counts_in, 
+                        per_cutoff = 0.1,
+                        counts_cutoff = 1){
+  #Keep genes with cpm of at least counts_cutoff in at least per_cutoff fraction of libraries
+  #CPM normalize
+  counts_cpm_norm <- as.data.frame(t(t(counts_in*10^6)/colSums(counts_in)))
+  
+  #Filter out lowly expressed genes
+  keepRows <- rowSums((counts_cpm_norm) >= counts_cutoff) >= per_cutoff*ncol(counts_cpm_norm)
+  counts_filtered <- counts_in[keepRows,]
+  
+  return(counts_filtered)
+  
+}
+
+#Run function to filter lowly expressed genes
+#counts_all_filtered <- gene_filter(counts_hgnc, 0.10) #all genes with HGNC symbols
+counts_pc_filtered <- gene_filter(counts_pc, 0.10, 1)
+
+normalize_counts <- function(counts_in, method){
+  #normalize using tmm or deconvolution
+  #tmm is good for bulk RNAseq
+  #deconvolution is best for large datasets of single cell RNAseq
+  #deconvolution is NOT recommended for smaller datasets (less than a few hundred cells)
+  
+  if(method == "decon"){
+  #Normalize using the deconvolution algorithm
+  decon_norm_factors <- computeSumFactors(as.matrix(counts_in))
+  counts_norm <- as.data.frame(t(t(counts_in)/decon_norm_factors))
+  }
+  
+  if(method == "tmm"){
+  #Normalize using the TMM algorithm 
+  dge <- DGEList(counts_in)
+  dge <- calcNormFactors(dge)
+  counts_norm <- cpm(dge, normalized.lib.sizes=TRUE)
+  }
+  
+  return(counts_norm)
+  
+}
+
+counts_pc_norm <- normalize_counts(counts_pc_filtered, "tmm")
+#counts_all_norm <- normalize_counts(counts_all_filtered, "tmm")
+
+#Write out normalized counts 
+#Add HGNC symbols to gene names
+#log 2 transform
+
+counts_out <- log2(counts_pc_norm+1)
+
+write.csv(counts_out, file.path(output_data_dir,"TMM_normalized_log2_transformed_counts.csv"), quote=FALSE, row.names = TRUE) 
+
+counts_info <- t(design_qc[,c("libid",
+                            "Tissue",
+                            "Stimulation",
+                            "Donor.ID",
+                            "Cell.Type")])
+
+colnames(counts_info) <- counts_info["libid",]
+counts_info <- counts_info[rownames(counts_info) != "libid",]
+counts_info <- as.data.frame(counts_info)
+counts_out <- as.data.frame(counts_out)
+counts_out2 <-rbind(counts_info, counts_out)
+
+write.csv(counts_out2, file.path(output_data_dir,"TMM_normalized_log2_transformed_counts_with_info.csv"), quote=FALSE, row.names = TRUE) 
+```
+
+# Gene Filtering
+
+A filter is applied to select protein coding genes with HGNC symbols. Genes with very low very low expression across all libraries are removed as these genes will not be informative in downstream analysis. This filter selects genes with a count of at least one per million reads in 10% of libraries. This results `r nrow(counts_pc_norm)` genes. The filtered genes are normalized using the TMM (trimmed mean of M values) algorithm.
+
+# Principal Component Analysis
+
+Principal component analysis was used to look for trends in gene expression in an unbiased manner. Below is a correlation matrix showing the correlation between the PC dimensions and variables available in the design.
+
+```{r pca}
+#Run PCA on the normalized log2 transformed counts data
+pca = prcomp(log2(as.data.frame(t(counts_pc_norm))+1), center=TRUE, scale=FALSE)
+
+#Get PCA resutls and merge with sample information stored in metrics
+sum_pca = summary(pca)
+pca_scores= as.data.frame(pca$x)
+
+pdatscores <- merge(design_qc, pca_scores, by.x = "libid", by.y="row.names")
+pc1_lab = paste("PC1 (", round(100*sum_pca$importance[2, 1], 1),  "%)", sep="")
+pc2_lab = paste("PC2 (", round(100*sum_pca$importance[2, 2], 1),  "%)", sep="")
+pc3_lab = paste("PC3 (", round(100*sum_pca$importance[2, 3], 1),  "%)", sep="")
+pc4_lab = paste("PC4 (", round(100*sum_pca$importance[2, 4], 1),  "%)", sep="")
+pc5_lab = paste("PC5 (", round(100*sum_pca$importance[2, 5], 1),  "%)", sep="")
+pc6_lab = paste("PC6 (", round(100*sum_pca$importance[2, 6], 1),  "%)", sep="")
+pc7_lab = paste("PC7 (", round(100*sum_pca$importance[2, 7], 1),  "%)", sep="")
+pc8_lab = paste("PC8 (", round(100*sum_pca$importance[2, 8], 1),  "%)", sep="")
+
+#Compute correlations between PCs and design variables 
+pc_cors <- calc_PCcors(pca, design_qc, id_col = "libid") %>%
+  t()
+pheatmap(pc_cors)
+
+```
+
+## PC1 and PC2
+PC1 and PC2 separate samples out most notably by the Treatment variable. In addition, there is separation based on the Cell Type. There is little difference seen between identical donors in Treatment groups None and IL1; and aCD3/28 and aCD3/28 plus IL1.
+
+```{r pca_plots_pc1_pc2_by_conc, fig.width=9, fig.height=9}
+
+font_size <- 10
+pt_size <- 1.5
+
+plot_layers <- list(labs(x = pc1_lab, y = pc2_lab),
+                 theme(text = element_text(size=font_size),
+                       aspect.ratio = 1)) 
+
+#Make a PCA plot
+g_pca_cell_type <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC1, 
+                 y=PC2, 
+                 color = Cell.Type,
+                 text = sample_desc),
+             size=pt_size) +
+  scale_color_manual(values = cell_type_colors,
+                     name = "Cell Type") +
+  plot_layers
+
+g_pca_stimulation <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC1, 
+                 y=PC2, 
+                 color = Stimulation,
+                 text = sample_desc),
+             size=pt_size) +
+  scale_color_manual(values = stimulation_colors,
+                     name = "Stimulation") +
+  plot_layers
+
+g_pca_cell_type_stimulation <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC1, 
+                 y=PC2, 
+                 color = Cell.Type_Stimulation,
+                 text = sample_desc),
+             size=pt_size) +
+  scale_color_manual(values = cell_type_stimulation_colors,
+                     name = "Cell Type and Stimulation") +
+  plot_layers
+
+g_pca_patient <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC1, 
+                 y=PC2, 
+                 color = as.factor(Donor.ID),
+                 text = sample_desc),
+             size=pt_size) +
+  scale_color_manual(values = patient_colors,
+                     name = "Donor") +
+  plot_layers
+
+g_pca_tissue <- ggplot() +
+  geom_point(data = pdatscores,
+             aes(x=PC1,
+                 y=PC2,
+                 color = as.factor(Tissue),
+                 text = sample_desc),
+             size=pt_size) +
+  scale_color_manual(values = tissue_colors,
+                     name = "Tissue") +
+  plot_layers
+
+g_pca_timepoint <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC1, 
+                 y=PC2, 
+                 color = as.factor(Timepoint),
+                 text = sample_desc),
+             size=pt_size) +
+  scale_color_manual(values = timepoint_colors,
+                     name = "Timepoint") +
+  plot_layers
+
+egg::ggarrange(g_pca_cell_type,
+             g_pca_stimulation,
+             g_pca_cell_type_stimulation,
+             g_pca_patient,
+             g_pca_tissue,
+             g_pca_timepoint,
+             ncol=2)
+```
+
+## PC3 and PC4
+PC3 and PC4 most notably separate samples by the Tissue and Cell Type variables. 
+
+```{r pca_plots_pc3_pc4_by_conc, fig.width=9, fig.height=9}
+
+plot_layers <- list(labs(x = pc3_lab, y = pc4_lab),
+                 theme(text = element_text(size=font_size),
+                       aspect.ratio = 1)) 
+
+#Make a PCA plot
+g_pca_cell_type <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC3, 
+                 y=PC4, 
+                 color = Cell.Type,
+                 text = sample_desc),
+             size=pt_size) +
+  scale_color_manual(values = cell_type_colors,
+                     name = "Cell Type") +
+  plot_layers
+
+g_pca_stimulation <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC3, 
+                 y=PC4, 
+                 color = Stimulation,
+                 text = sample_desc),
+             size=pt_size) +
+  scale_color_manual(values = stimulation_colors,
+                     name = "Stimulation") +
+  plot_layers
+
+g_pca_cell_type_stimulation <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC3, 
+                 y=PC4, 
+                 color = Cell.Type_Stimulation,
+                 text = sample_desc),
+             size=pt_size) +
+  scale_color_manual(values = cell_type_stimulation_colors,
+                     name = "Cell Type and Stimulation") +
+  plot_layers
+
+g_pca_patient <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC3, 
+                 y=PC4, 
+                 color = as.factor(Donor.ID),
+                 text = sample_desc),
+             size=pt_size) +
+  scale_color_manual(values = patient_colors,
+                     name = "Donor") +
+  plot_layers
+
+g_pca_tissue <- ggplot() +
+  geom_point(data = pdatscores,
+             aes(x=PC3,
+                 y=PC4,
+                 color = as.factor(Tissue),
+                 text = sample_desc),
+             size=pt_size) +
+  scale_color_manual(values = tissue_colors,
+                     name = "Tissue") +
+  plot_layers
+
+g_pca_timepoint <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC3, 
+                 y=PC4, 
+                 color = as.factor(Timepoint),
+                 text = sample_desc),
+             size=pt_size) +
+  scale_color_manual(values = timepoint_colors,
+                     name = "Timepoint") +
+  plot_layers
+
+egg::ggarrange(g_pca_cell_type,
+             g_pca_stimulation,
+             g_pca_cell_type_stimulation,
+             g_pca_patient,
+             g_pca_tissue,
+             g_pca_timepoint,
+             ncol=2)
+```
+
+## PC5 and PC6
+
+PC5 and PC6 may show some heterogeniety with the Treatment group Ex Vivo, but otherwise does not appear to separate samples by any of the observed variables.
+
+There was concern that samples that produced high cDNA amounts or did not have the targeted cell number would be suspect. Samples that did not have the target cell value of 500 cells still appear to group with those that do in their respective variable groups across all PC dimensions. Therefore, they were maintained in the following analysis. Samples that had high cDNA (>25 ng/uL by Qubit) appeared to mostly be from PBMC Tregs stimulated with aCD3/28 or aCD3/28 plus IL1. I would assume that high cDNA concentration is due to these type of Tregs having a higher transcriptional activity as compared to others in the analysis. Likewise, these samples were maintained in the following analysis.
+
+```{r pca_plots_pc5_pc6_by_conc, fig.width=9, fig.height=9}
+
+plot_layers <- list(labs(x = pc5_lab, y = pc6_lab),
+                 theme(text = element_text(size=font_size),
+                       aspect.ratio = 1)) 
+
+#Make a PCA plot
+g_pca_cell_type <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC5, 
+                 y=PC6, 
+                 color = Cell.Type,
+                 text = sample_desc),
+             size=pt_size) +
+  scale_color_manual(values = cell_type_colors,
+                     name = "Cell type") +
+  plot_layers
+
+g_pca_stimulation <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC5, 
+                 y=PC6, 
+                 color = Stimulation,
+                 text = sample_desc),
+             size=pt_size) +
+  scale_color_manual(values = stimulation_colors,
+                     name = "Stimulation") +
+  plot_layers
+
+g_pca_cell_type_stimulation <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC5, 
+                 y=PC6, 
+                 color = Cell.Type_Stimulation,
+                 text = sample_desc),
+             size=pt_size) +
+  scale_color_manual(values = cell_type_stimulation_colors,
+                     name = "Cell Type and Stimulation") +
+  plot_layers
+
+g_pca_patient <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC5, 
+                 y=PC6, 
+                 color = as.factor(Donor.ID),
+                 text = sample_desc),
+             size=pt_size) +
+  scale_color_manual(values = patient_colors,
+                     name = "Donor") +
+  plot_layers
+
+g_pca_tissue <- ggplot() +
+  geom_point(data = pdatscores,
+             aes(x=PC5,
+                 y=PC6,
+                 color = as.factor(Tissue),
+                 text = sample_desc),
+             size=pt_size) +
+  scale_color_manual(values = tissue_colors,
+                     name = "Tissue") +
+  plot_layers
+
+g_pca_timepoint <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC5, 
+                 y=PC6, 
+                 color = as.factor(Timepoint),
+                 text = sample_desc),
+             size=pt_size) +
+  scale_color_manual(values = timepoint_colors,
+                     name = "Timepoint") +
+  plot_layers
+
+egg::ggarrange(g_pca_cell_type,
+             g_pca_stimulation,
+             g_pca_cell_type_stimulation,
+             g_pca_patient,
+             g_pca_tissue,
+             g_pca_timepoint,
+             ncol=2)
+```
+
+```{r make_volcano_plots_for_pub}
+
+plot_volcano <- function(top_table_in,
+                         fc_cutoff = 1,
+                         p_cutoff = 0.1,
+                         fc_for_anno = 1,
+                         p_for_anno = 0.1,
+                         title = "",
+                         color_labels = NULL,
+                         right_up_color = "#862020",
+                         left_up_color = "#e07872",
+                         x_scale = "",
+                         y_scale = "",
+                         left_up_label = "",
+                         right_up_label = ""){
+  
+  top_table_in$gene_name <- rownames(top_table_in)
+
+selected_genes_anno <- top_table_in %>%
+  dplyr::filter((abs(logFC) > fc_for_anno & adj.P.Val < p_for_anno))
+
+top_table_in <- top_table_in %>%
+  mutate(Color = ifelse(logFC < -fc_cutoff & adj.P.Val < p_cutoff, "left_up", 
+                        ifelse(logFC > fc_cutoff & adj.P.Val < p_cutoff, "right_up","")))
+
+v_cols <- c("left_up" = left_up_color, "right_up" = right_up_color, "grey80")
+color_labels <- c("left_up" = left_up_label, "right_up" = right_up_label)
+
+g_volcano <- ggplot(data = top_table_in, aes(x=logFC, y=-log10(adj.P.Val), color = Color)) +
+  geom_point(alpha=0.7, size=2.5, shape = 19) +
+  #theme(legend.position = "none") +
+  scale_color_manual(values = v_cols, name = "", labels = color_labels)+
+  xlab("log2 fold change") + ylab("-log10 FDR")+ ggtitle(title) +
+  geom_vline(xintercept=fc_cutoff, color="black", linetype="dotted",size=1.0) +
+  geom_vline(xintercept=-1*fc_cutoff, color="black", linetype="dotted",size=1.0)+
+  geom_hline(yintercept=-log10(p_cutoff), color="black",linetype="dotted",size=1.0)+
+   geom_text_repel(data = selected_genes_anno,
+             aes(x=logFC, y=-log10(adj.P.Val),label=gene_name), 
+             size=2.5, color="black", segment.size  = 0.1, segment.alpha = 0.5)+
+  # xlim(c(-10,15))+
+  # ylim(c(0,12))+
+ {if(x_scale != "") xlim(x_scale)}+
+  {if(y_scale != "") ylim(y_scale)}+
+  theme(text = element_text(size=12))
+
+return(g_volcano)
+}
+```
+
+```{r subset_for_DE_analysis}
+# Subset to highest quality unique samples 
+# for samples that were repeated
+# Best defined as minimum median CD coverage
+
+design_unique <- design_qc
+# design_unique <- design_qc %>%
+#   dplyr::group_by(cDNA.Sample.ID) %>%
+#   dplyr::filter(median_cv_coverage == min(median_cv_coverage))
+
+counts_unique <- counts_pc_norm[,design_unique$libid]
+
+counts_out_unique <- log2(counts_unique+1)
+
+counts_info <- t(design_unique[,c("libid",
+                            "Stimulation",
+                            "Cell.Type",
+                            "Donor.ID",
+                            "Tissue")])
+
+colnames(counts_info) <- counts_info["libid",]
+counts_info <- counts_info[rownames(counts_info) != "libid",]
+counts_info <- as.data.frame(counts_info)
+counts_out_unique <- as.data.frame(counts_out_unique)
+counts_out_unique2 <-rbind(counts_info, counts_out_unique)
+
+write.csv(counts_out_unique2, file.path(output_data_dir,"TMM_normalized_log2_transformed_counts_all_samples.csv"), quote=FALSE, row.names = TRUE) 
+```
+
+# Blood and Tissue Tregs Differential Expression, Modeling Gene Expression Across All Samples
+
+Gene expression was modeled according to cell type and treatment for all Blood and Tumor derived Treg samples. Patient identity was modeled as a random effect. 
+
+```{r model_blood_and_tissue}
+#Make a big model of all contrasts
+
+selected_design <- design_unique 
+# %>%
+  # dplyr::filter(Tissue == "Tumor" & Stimulation != "No_Stim") %>%
+  # droplevels(.)
+
+selected_counts <- counts_pc_norm[,selected_design$libid]
+
+# design_mat <- model.matrix(~0+selected_design$stim_time+selected_design$batch)
+design_mat <- model.matrix(~0+selected_design$sample_desc)
+
+#simplify columns names so contrasts are easier to make later
+colnames(design_mat) <- str_extract(colnames(design_mat),"([A-Z])\\w+")
+
+vwts <- voomWithQualityWeights(selected_counts, design= design_mat, plot=F, span=0.1)
+
+#Get model fits
+corfit <- duplicateCorrelation(vwts,
+                               design=design_mat,
+                               block=selected_design$Donor.ID)
+
+#Run voom again. Recommended by G. Smyth
+#https://support.bioconductor.org/p/59700/
+vwts <- voomWithQualityWeights(selected_counts, design= design_mat, 
+                               block = selected_design$Donor.ID,
+                               correlation = corfit$consensus)
+
+# fit model, including random effect
+vfit_corfit <-
+  lmFit(vwts,
+        block=selected_design$Donor.ID,
+        correlation=corfit$consensus.correlation)
+
+vfit_corfit_eb <- eBayes(vfit_corfit)
+
+#Set up contrasts
+
+contrasts_stim <- makeContrasts(
+  
+  "Blood_Treg_IL1R1_Neg_Miltenyi_Beads_D1-Blood_Treg_IL1R1_Neg_No_Stim_D1",
+  "Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_D1-Tumor_Treg_IL1R1_Neg_No_Stim_D1",
+  "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_D1-Tumor_Treg_IL1R1_Pos_No_Stim_D1",
+  
+  
+  "Blood_Treg_IL1R1_Neg_Miltenyi_Beads_D2-Blood_Treg_IL1R1_Neg_No_Stim_D1",
+  "Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_D2-Tumor_Treg_IL1R1_Neg_No_Stim_D1",
+  "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_D2-Tumor_Treg_IL1R1_Pos_No_Stim_D1",
+  
+  
+  "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_and_IL1b_D1-Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b_D1",
+  "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_D1-Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_D1",
+  
+  "Blood_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b_D1-Blood_Treg_IL1R1_Neg_Miltenyi_Beads_D1",
+  "Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b_D1-Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_D1",
+  "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_and_IL1b_D1-Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_D1",
+  
+  
+  "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_and_IL1b_D2-Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b_D2",
+  "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_D2-Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_D2",
+  
+  "Blood_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b_D2-Blood_Treg_IL1R1_Neg_Miltenyi_Beads_D2",
+  "Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b_D2-Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_D2",
+  "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_and_IL1b_D2-Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_D2",
+  
+  
+  "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_and_IL1b_D3-Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b_D3",
+  "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_D3-Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_D3",
+  
+  "Blood_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b_D3-Blood_Treg_IL1R1_Neg_Miltenyi_Beads_D3",
+  "Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b_D3-Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_D3",
+  "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_and_IL1b_D3-Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_D3",
+  
+  
+  levels=design_mat)
+
+fit2 <- contrasts.fit(vfit_corfit_eb, contrasts_stim)
+fit2 <- eBayes(fit2)
+```
+
+```{r make_dge_top_tables}
+
+top_genes__D1_Blood_IL1R1_Neg__No_Stim_v_Miltenyi_Beads <- topTable(fit2, coef = "Blood_Treg_IL1R1_Neg_Miltenyi_Beads_D1-Blood_Treg_IL1R1_Neg_No_Stim_D1",
+                                                                    sort.by = "P", number = Inf)
+top_genes__D1_Tumor_IL1R1_Neg__No_Stim_v_Miltenyi_Beads <- topTable(fit2, coef = "Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_D1-Tumor_Treg_IL1R1_Neg_No_Stim_D1",
+                                                                    sort.by = "P", number = Inf)
+top_genes__D1_Tumor_IL1R1_Pos__No_Stim_v_Miltenyi_Beads <- topTable(fit2, coef = "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_D1-Tumor_Treg_IL1R1_Pos_No_Stim_D1",
+                                                                    sort.by = "P", number = Inf)
+
+top_genes__D2_Blood_IL1R1_Neg__No_Stim_v_Miltenyi_Beads <- topTable(fit2, coef = "Blood_Treg_IL1R1_Neg_Miltenyi_Beads_D2-Blood_Treg_IL1R1_Neg_No_Stim_D1",
+                                                                    sort.by = "P", number = Inf)
+top_genes__D2_Tumor_IL1R1_Neg__No_Stim_v_Miltenyi_Beads <- topTable(fit2, coef = "Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_D2-Tumor_Treg_IL1R1_Neg_No_Stim_D1",
+                                                                    sort.by = "P", number = Inf)
+top_genes__D2_Tumor_IL1R1_Pos__No_Stim_v_Miltenyi_Beads <- topTable(fit2, coef = "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_D2-Tumor_Treg_IL1R1_Pos_No_Stim_D1",
+                                                                    sort.by = "P", number = Inf)
+
+
+
+top_genes__D1_Tumor_Miltenyi_Beads_and_IL1b__IL1R1_Neg_v_Pos <- topTable(fit2, coef = "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_and_IL1b_D1-Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b_D1",
+                                                                          sort.by = "P", number = Inf)
+top_genes__D1_Tumor_Miltenyi_Beads__IL1R1_Neg_v_Pos <-          topTable(fit2, coef = "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_D1-Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_D1",
+                                                                          sort.by = "P", number = Inf)
+
+top_genes__D1_Blood_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b <- topTable(fit2, coef = "Blood_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b_D1-Blood_Treg_IL1R1_Neg_Miltenyi_Beads_D1",
+                                                                                    sort.by = "P", number = Inf)
+top_genes__D1_Tumor_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b <- topTable(fit2, coef = "Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b_D1-Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_D1",
+                                                                                    sort.by = "P", number = Inf)
+top_genes__D1_Tumor_IL1R1_Pos__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b <- topTable(fit2, coef = "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_and_IL1b_D1-Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_D1",
+                                                                                    sort.by = "P", number = Inf)
+
+
+
+top_genes__D2_Tumor_Miltenyi_Beads_and_IL1b__IL1R1_Neg_v_Pos <- topTable(fit2, coef = "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_and_IL1b_D2-Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b_D2",
+                                                                          sort.by = "P", number = Inf)
+top_genes__D2_Tumor_Miltenyi_Beads__IL1R1_Neg_v_Pos <-          topTable(fit2, coef = "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_D2-Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_D2",
+                                                                          sort.by = "P", number = Inf)
+
+top_genes__D2_Blood_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b <- topTable(fit2, coef = "Blood_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b_D2-Blood_Treg_IL1R1_Neg_Miltenyi_Beads_D2",
+                                                                                    sort.by = "P", number = Inf)
+top_genes__D2_Tumor_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b <- topTable(fit2, coef = "Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b_D2-Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_D2",
+                                                                                    sort.by = "P", number = Inf)
+top_genes__D2_Tumor_IL1R1_Pos__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b <- topTable(fit2, coef = "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_and_IL1b_D2-Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_D2",
+                                                                                    sort.by = "P", number = Inf)
+
+
+
+top_genes__D3_Tumor_Miltenyi_Beads_and_IL1b__IL1R1_Neg_v_Pos <- topTable(fit2, coef = "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_and_IL1b_D3-Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b_D3",
+                                                                          sort.by = "P", number = Inf)
+top_genes__D3_Tumor_Miltenyi_Beads__IL1R1_Neg_v_Pos <-          topTable(fit2, coef = "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_D3-Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_D3",
+                                                                          sort.by = "P", number = Inf)
+
+top_genes__D3_Blood_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b <- topTable(fit2, coef = "Blood_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b_D3-Blood_Treg_IL1R1_Neg_Miltenyi_Beads_D3",
+                                                                                    sort.by = "P", number = Inf)
+top_genes__D3_Tumor_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b <- topTable(fit2, coef = "Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b_D3-Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_D3",
+                                                                                    sort.by = "P", number = Inf)
+top_genes__D3_Tumor_IL1R1_Pos__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b <- topTable(fit2, coef = "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_and_IL1b_D3-Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_D3",
+                                                                                    sort.by = "P", number = Inf)
+
+
+# Request from Florian 2021-11-20
+
+number_DGE <- function(data_in){
+  data_in <- data_in %>%
+    mutate(Sig = if_else(logFC > 1 & adj.P.Val < 0.1, "up", 
+           if_else(logFC < -1 & adj.P.Val < 0.1, "down", "not_sig")))
+  table(data_in$Sig)
+}
+
+number_DGE(top_genes__D2_Blood_IL1R1_Neg__No_Stim_v_Miltenyi_Beads)
+number_DGE(top_genes__D2_Tumor_IL1R1_Neg__No_Stim_v_Miltenyi_Beads)
+number_DGE(top_genes__D2_Tumor_IL1R1_Pos__No_Stim_v_Miltenyi_Beads)
+
+```
+
+```{r write_dge_top_tables}
+
+write.csv(top_genes__D1_Blood_IL1R1_Neg__No_Stim_v_Miltenyi_Beads,
+          file.path(output_data_dir,"top_genes__D1_Blood_IL1R1_Neg__No_Stim_v_Miltenyi_Beads.csv"),
+          quote=FALSE, row.names = TRUE)
+write.csv(top_genes__D1_Tumor_IL1R1_Neg__No_Stim_v_Miltenyi_Beads,
+          file.path(output_data_dir,"top_genes__D1_Tumor_IL1R1_Neg__No_Stim_v_Miltenyi_Beads.csv"),
+          quote=FALSE, row.names = TRUE)
+write.csv(top_genes__D1_Tumor_IL1R1_Pos__No_Stim_v_Miltenyi_Beads,
+          file.path(output_data_dir,"top_genes__D1_Tumor_IL1R1_Pos__No_Stim_v_Miltenyi_Beads.csv"),
+          quote=FALSE, row.names = TRUE)
+
+write.csv(top_genes__D2_Blood_IL1R1_Neg__No_Stim_v_Miltenyi_Beads,
+          file.path(output_data_dir,"top_genes__D2_Blood_IL1R1_Neg__No_Stim_v_Miltenyi_Beads.csv"),
+          quote=FALSE, row.names = TRUE)
+write.csv(top_genes__D2_Tumor_IL1R1_Neg__No_Stim_v_Miltenyi_Beads,
+          file.path(output_data_dir,"top_genes__D2_Tumor_IL1R1_Neg__No_Stim_v_Miltenyi_Beads.csv"),
+          quote=FALSE, row.names = TRUE)
+write.csv(top_genes__D2_Tumor_IL1R1_Pos__No_Stim_v_Miltenyi_Beads,
+          file.path(output_data_dir,"top_genes__D2_Tumor_IL1R1_Pos__No_Stim_v_Miltenyi_Beads.csv"),
+          quote=FALSE, row.names = TRUE)
+
+
+
+write.csv(top_genes__D1_Tumor_Miltenyi_Beads_and_IL1b__IL1R1_Neg_v_Pos,
+          file.path(output_data_dir,"top_genes__D1_Tumor_Miltenyi_Beads_and_IL1b__IL1R1_Neg_v_Pos.csv"),
+          quote=FALSE, row.names = TRUE)
+write.csv(top_genes__D1_Tumor_Miltenyi_Beads__IL1R1_Neg_v_Pos,
+          file.path(output_data_dir,"top_genes__D1_Tumor_Miltenyi_Beads__IL1R1_Neg_v_Pos.csv"),
+          quote=FALSE, row.names = TRUE)
+
+write.csv(top_genes__D1_Blood_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b,
+          file.path(output_data_dir,"top_genes__D1_Blood_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b.csv"),
+          quote=FALSE, row.names = TRUE)
+write.csv(top_genes__D1_Tumor_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b,
+          file.path(output_data_dir,"top_genes__D1_Tumor_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b.csv"),
+          quote=FALSE, row.names = TRUE)
+write.csv(top_genes__D1_Tumor_IL1R1_Pos__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b,
+          file.path(output_data_dir,"top_genes__D1_Tumor_IL1R1_Pos__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b.csv"),
+          quote=FALSE, row.names = TRUE)
+
+
+
+write.csv(top_genes__D2_Tumor_Miltenyi_Beads_and_IL1b__IL1R1_Neg_v_Pos,
+          file.path(output_data_dir,"top_genes__D2_Tumor_Miltenyi_Beads_and_IL1b__IL1R1_Neg_v_Pos.csv"),
+          quote=FALSE, row.names = TRUE)
+write.csv(top_genes__D2_Tumor_Miltenyi_Beads__IL1R1_Neg_v_Pos,
+          file.path(output_data_dir,"top_genes__D2_Tumor_Miltenyi_Beads__IL1R1_Neg_v_Pos.csv"),
+          quote=FALSE, row.names = TRUE)
+
+write.csv(top_genes__D2_Blood_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b,
+          file.path(output_data_dir,"top_genes__D2_Blood_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b.csv"),
+          quote=FALSE, row.names = TRUE)
+write.csv(top_genes__D2_Tumor_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b,
+          file.path(output_data_dir,"top_genes__D2_Tumor_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b.csv"),
+          quote=FALSE, row.names = TRUE)
+write.csv(top_genes__D2_Tumor_IL1R1_Pos__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b,
+          file.path(output_data_dir,"top_genes__D2_Tumor_IL1R1_Pos__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b.csv"),
+          quote=FALSE, row.names = TRUE)
+
+
+
+write.csv(top_genes__D3_Tumor_Miltenyi_Beads_and_IL1b__IL1R1_Neg_v_Pos,
+          file.path(output_data_dir,"top_genes__D3_Tumor_Miltenyi_Beads_and_IL1b__IL1R1_Neg_v_Pos.csv"),
+          quote=FALSE, row.names = TRUE)
+write.csv(top_genes__D3_Tumor_Miltenyi_Beads__IL1R1_Neg_v_Pos,
+          file.path(output_data_dir,"top_genes__D3_Tumor_Miltenyi_Beads__IL1R1_Neg_v_Pos.csv"),
+          quote=FALSE, row.names = TRUE)
+
+write.csv(top_genes__D3_Blood_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b,
+          file.path(output_data_dir,"top_genes__D3_Blood_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b.csv"),
+          quote=FALSE, row.names = TRUE)
+write.csv(top_genes__D3_Tumor_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b,
+          file.path(output_data_dir,"top_genes__D3_Tumor_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b.csv"),
+          quote=FALSE, row.names = TRUE)
+write.csv(top_genes__D3_Tumor_IL1R1_Pos__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b,
+          file.path(output_data_dir,"top_genes__D3_Tumor_IL1R1_Pos__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b.csv"),
+          quote=FALSE, row.names = TRUE)
+
+
+```
+
+```{r volcano_plots, fig.width=12, fig.height=9, dependson="make_volcano_plots_for_pub"}
+
+# IL1R1 Pos Up    : "#862020"
+# IL1R1 Neg Up    : "#e07872"
+# Neutral         : "grey80"
+# Down Neg or Pos : "grey50"
+
+# D1 and D2: Beads vs Beads and IL1b
+
+vol__D1_Blood_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b <- plot_volcano(top_genes__D1_Blood_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b,
+                                                                                          title = "D1 Blood IL1R1 Negative Tregs: Miltenyi Beads Vs Miltenyi Beads with IL1b",
+                                                                                          left_up_label = "Up in Beads Only",
+                                                                                          right_up_label = "Up in Beads with IL1b",
+                                                                                          left_up_color = "grey50",
+                                                                                          right_up_color = "#e07872")
+
+vol__D1_Tumor_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b <- plot_volcano(top_genes__D1_Tumor_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b,
+                                                                                          title = "D1 Tumor IL1R1 Negative Tregs: Miltenyi Beads Vs Miltenyi Beads with IL1b",
+                                                                                          left_up_label = "Up in Beads Only",
+                                                                                          right_up_label = "Up in Beads with IL1b",
+                                                                                          left_up_color = "grey50",
+                                                                                          right_up_color = "#e07872")
+
+vol__D1_Tumor_IL1R1_Pos__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b <- plot_volcano(top_genes__D1_Tumor_IL1R1_Pos__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b,
+                                                                                          title = "D1 Tumor IL1R1 Positive Tregs: Miltenyi Beads Vs Miltenyi Beads with IL1b",
+                                                                                          left_up_label = "Up in Beads Only",
+                                                                                          right_up_label = "Up in Beads with IL1b",
+                                                                                          left_up_color = "grey50",
+                                                                                          right_up_color = "#862020")
+
+
+
+vol__D2_Blood_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b <- plot_volcano(top_genes__D2_Blood_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b,
+                                                                                          title = "D2 Blood IL1R1 Negative Tregs: Miltenyi Beads Vs Miltenyi Beads with IL1b",
+                                                                                          left_up_label = "Up in Beads Only",
+                                                                                          right_up_label = "Up in Beads with IL1b",
+                                                                                          left_up_color = "grey50",
+                                                                                          right_up_color = "#e07872",
+                                                                                          y_scale = c(0,4),
+                                                                                          x_scale = c(-5,5))
+
+vol__D2_Tumor_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b <- plot_volcano(top_genes__D2_Tumor_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b,
+                                                                                          title = "D2 Tumor IL1R1 Negative Tregs: Miltenyi Beads Vs Miltenyi Beads with IL1b",
+                                                                                          left_up_label = "Up in Beads Only",
+                                                                                          right_up_label = "Up in Beads with IL1b",
+                                                                                          left_up_color = "grey50",
+                                                                                          right_up_color = "#e07872",
+                                                                                          y_scale = c(0,4),
+                                                                                          x_scale = c(-5,5))
+
+vol__D2_Tumor_IL1R1_Pos__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b <- plot_volcano(top_genes__D2_Tumor_IL1R1_Pos__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b,
+                                                                                          title = "D2 Tumor IL1R1 Positive Tregs: Miltenyi Beads Vs Miltenyi Beads with IL1b",
+                                                                                          left_up_label = "Up in Beads Only",
+                                                                                          right_up_label = "Up in Beads with IL1b",
+                                                                                          left_up_color = "grey50",
+                                                                                          right_up_color = "#862020",
+                                                                                          y_scale = c(0,4),
+                                                                                          x_scale = c(-5,5))
+
+# D1 and D2: No Stim vs Beads
+
+
+
+vol__D1_Blood_IL1R1_Neg__No_Stim_v_Miltenyi_Beads <- plot_volcano(top_genes__D1_Blood_IL1R1_Neg__No_Stim_v_Miltenyi_Beads,
+                                                                          title = "D1 Blood IL1R1 Negative Tregs: No Stim Vs Miltenyi Beads",
+                                                                          left_up_label = "Up in No Stim",
+                                                                          right_up_label = "Up in Beads Only",
+                                                                          left_up_color = "grey50",
+                                                                          right_up_color = "#e07872")
+
+vol__D1_Tumor_IL1R1_Neg__No_Stim_v_Miltenyi_Beads <- plot_volcano(top_genes__D1_Tumor_IL1R1_Neg__No_Stim_v_Miltenyi_Beads,
+                                                                          title = "D1 Tumor IL1R1 Negative Tregs: No Stim Vs Miltenyi Beads",
+                                                                          left_up_label = "Up in No Stim",
+                                                                          right_up_label = "Up in Beads Only",
+                                                                          left_up_color = "grey50",
+                                                                          right_up_color = "#e07872")
+
+vol__D1_Tumor_IL1R1_Pos__No_Stim_v_Miltenyi_Beads <- plot_volcano(top_genes__D1_Tumor_IL1R1_Pos__No_Stim_v_Miltenyi_Beads,
+                                                                          title = "D1 Tumor IL1R1 Positive Tregs: No Stim Vs Miltenyi Beads",
+                                                                          left_up_label = "Up in No Stim",
+                                                                          right_up_label = "Up in Beads Only",
+                                                                          left_up_color = "grey50",
+                                                                          right_up_color = "#862020")
+
+
+
+vol__D2_Blood_IL1R1_Neg__No_Stim_v_Miltenyi_Beads <- plot_volcano(top_genes__D2_Blood_IL1R1_Neg__No_Stim_v_Miltenyi_Beads,
+                                                                          title = "D2 Blood IL1R1 Negative Tregs: No Stim Vs Miltenyi Beads",
+                                                                          left_up_label = "Up in No Stim",
+                                                                          right_up_label = "Up in Beads Only",
+                                                                          left_up_color = "grey50",
+                                                                          right_up_color = "#e07872")
+
+vol__D2_Tumor_IL1R1_Neg__No_Stim_v_Miltenyi_Beads <- plot_volcano(top_genes__D2_Tumor_IL1R1_Neg__No_Stim_v_Miltenyi_Beads,
+                                                                          title = "D2 Tumor IL1R1 Negative Tregs: No Stim Vs Miltenyi Beads",
+                                                                          left_up_label = "Up in No Stim",
+                                                                          right_up_label = "Up in Beads Only",
+                                                                          left_up_color = "grey50",
+                                                                          right_up_color = "#e07872")
+
+vol__D2_Tumor_IL1R1_Pos__No_Stim_v_Miltenyi_Beads <- plot_volcano(top_genes__D2_Tumor_IL1R1_Pos__No_Stim_v_Miltenyi_Beads,
+                                                                          title = "D2 Tumor IL1R1 Positive Tregs: No Stim Vs Miltenyi Beads",
+                                                                          left_up_label = "Up in No Stim",
+                                                                          right_up_label = "Up in Beads Only",
+                                                                          left_up_color = "grey50",
+                                                                          right_up_color = "#862020")
+
+
+
+ggsave(filename = "vol__D1_Blood_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b.pdf",
+       plot = vol__D1_Blood_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b,
+       path = plots_dir,
+       width = 12, 
+       height = 7.5)
+
+ggsave(filename = "vol__D1_Tumor_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b.pdf",
+       plot = vol__D1_Tumor_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b,
+       path = plots_dir,
+       width = 12, 
+       height = 7.5)
+
+ggsave(filename = "vol__D1_Tumor_IL1R1_Pos__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b.pdf",
+       plot = vol__D1_Tumor_IL1R1_Pos__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b,
+       path = plots_dir,
+       width = 12, 
+       height = 7.5)
+
+
+
+ggsave(filename = "vol__D2_Blood_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b.pdf",
+       plot = vol__D2_Blood_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b,
+       path = plots_dir,
+       width = 12, 
+       height = 7.5)
+
+ggsave(filename = "vol__D2_Tumor_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b.pdf",
+       plot = vol__D2_Tumor_IL1R1_Neg__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b,
+       path = plots_dir,
+       width = 12, 
+       height = 7.5)
+
+ggsave(filename = "vol__D2_Tumor_IL1R1_Pos__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b.pdf",
+       plot = vol__D2_Tumor_IL1R1_Pos__Miltenyi_Beads_v_Miltenyi_Beads_and_IL1b,
+       path = plots_dir,
+       width = 12, 
+       height = 7.5)
+
+
+
+ggsave(filename = "vol__D1_Blood_IL1R1_Neg__No_Stim_v_Miltenyi_Beads.pdf",
+       plot = vol__D1_Blood_IL1R1_Neg__No_Stim_v_Miltenyi_Beads,
+       path = plots_dir,
+       width = 12, 
+       height = 7.5)
+
+
+ggsave(filename = "vol__D1_Tumor_IL1R1_Neg__No_Stim_v_Miltenyi_Beads.pdf",
+       plot = vol__D1_Tumor_IL1R1_Neg__No_Stim_v_Miltenyi_Beads,
+       path = plots_dir,
+       width = 12, 
+       height = 7.5)
+
+ggsave(filename = "vol__D1_Tumor_IL1R1_Pos__No_Stim_v_Miltenyi_Beads.pdf",
+       plot = vol__D1_Tumor_IL1R1_Pos__No_Stim_v_Miltenyi_Beads,
+       path = plots_dir,
+       width = 12, 
+       height = 7.5)
+
+
+
+ggsave(filename = "vol__D2_Blood_IL1R1_Neg__No_Stim_v_Miltenyi_Beads.pdf",
+       plot = vol__D2_Blood_IL1R1_Neg__No_Stim_v_Miltenyi_Beads,
+       path = plots_dir,
+       width = 12, 
+       height = 7.5)
+
+ggsave(filename = "vol__D2_Tumor_IL1R1_Neg__No_Stim_v_Miltenyi_Beads.pdf",
+       plot = vol__D2_Tumor_IL1R1_Neg__No_Stim_v_Miltenyi_Beads,
+       path = plots_dir,
+       width = 12, 
+       height = 7.5)
+
+ggsave(filename = "vol__D2_Tumor_IL1R1_Pos__No_Stim_v_Miltenyi_Beads.pdf",
+       plot = vol__D2_Tumor_IL1R1_Pos__No_Stim_v_Miltenyi_Beads,
+       path = plots_dir,
+       width = 12, 
+       height = 7.5)
+```
+
+# Plots of Individual Genes
+
+The following plots depicts the log2 of the normalized counts for individual genes selected by Cell Type and Treatment conditions. 
+
+```{r function_for_gene_plots}
+plot_gene <- function(gene,
+                      counts_in,
+                      design_in){
+
+  #Make sure libs in design and counts are in the same order
+  if(sum(design_in$libid != colnames(counts_in))!= 0){
+    print("Check to make sure the order of libraries in counts and design match")
+    return(NULL)}
+
+  #Add gene count into to design_in
+
+  design_in$gene <- counts_in[rownames(counts_in) == gene,]
+  design_in$gene <- log2(design_in$gene +1)
+  
+  design_in <- design_in %>%
+    mutate(Cell.Type_Stimulation_Tissue = paste(Tissue, Cell.Type_Stimulation, sep = "_"))
+
+  # design_in <- design_in %>%
+  #   dplyr::filter(Timepoint != "D3" & Tissue != "Blood")
+
+  design_in$Cell.Type_Stimulation_Tissue <- factor(design_in$Cell.Type_Stimulation_Tissue, levels = c("Blood_Treg_IL1R1_Neg_No_Stim",
+                                                                                                      "Blood_Treg_IL1R1_Neg_Miltenyi_Beads",
+                                                                                                      "Blood_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b",
+                                                                                                      "Tumor_Treg_IL1R1_Neg_No_Stim",
+                                                                                                      "Tumor_Treg_IL1R1_Neg_Miltenyi_Beads",
+                                                                                                      "Tumor_Treg_IL1R1_Neg_Miltenyi_Beads_and_IL1b",
+                                                                                                      "Tumor_Treg_IL1R1_Pos_No_Stim",
+                                                                                                      "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads",
+                                                                                                      "Tumor_Treg_IL1R1_Pos_Miltenyi_Beads_and_IL1b"))
+
+g_gene_exp <- ggplot(design_in, aes(x=interaction(Cell.Type_Stimulation_Tissue),
+                             y = gene, fill=Cell.Type, color = Cell.Type))+
+  # geom_bar(stat= "summary", fun.y = "mean", aes(fill=Cell.Type, color = Cell.Type))+
+  
+  stat_summary(fun = "mean", geom = "bar") +
+  stat_summary(fun = "mean", geom = "point",size = 1) +
+  stat_summary(fun.data = "mean_se",
+               geom = "errorbar",
+               width = .2)+
+  
+  scale_fill_manual(values = alpha(cell_type_colors, .7))+
+  scale_color_manual(values = cell_type_colors)+
+  geom_quasirandom(design_in, mapping = aes(x=interaction(Cell.Type_Stimulation_Tissue),
+                             y = gene))+
+    expand_limits(y=0) +
+    labs(x="", y=paste0(gene, " expression,\n log2 CPM"))+
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+    theme(text = element_text(size=12)) +
+    facet_wrap(~ Timepoint,
+                labeller = labeller(Timepoint = label_wrap_gen(15)),
+               nrow=1)
+
+ggsave(filename = paste("geneplot_tumor_",gene,"_mean_and_se_v2.pdf", sep = ""),
+       plot = g_gene_exp,
+       path = plots_dir,
+       width = 12, height = 7.5)
+
+return(g_gene_exp)
+}
+```
+
+```{r plot_genes_of_interest, fig.width=9, fig.height=5}
+
+plot_gene("IL1R1", counts_unique, design_unique)
+plot_gene("IL2", counts_unique, design_unique)
+plot_gene("IL2RA", counts_unique, design_unique)
+plot_gene("IL23R", counts_unique, design_unique)
+plot_gene("FOXP3", counts_unique, design_unique)
+plot_gene("CTLA4", counts_unique, design_unique)
+plot_gene("IKZF2", counts_unique, design_unique)
+plot_gene("RORC", counts_unique, design_unique)
+plot_gene("BATF", counts_unique, design_unique)
+
+plot_gene("MKI67", counts_unique, design_unique)
+plot_gene("CDC20", counts_unique, design_unique)
+plot_gene("TOP2A", counts_unique, design_unique)
+plot_gene("CDCA8", counts_unique, design_unique)
+plot_gene("E2F1", counts_unique, design_unique)
+```
